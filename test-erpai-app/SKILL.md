@@ -142,6 +142,44 @@ For each workflow (Node scripts in `scripts/*.mjs` or ERPAI auto-builder workflo
 - Idempotency: run twice → second run writes 0 rows
 - Edge cases: empty source, failed/skipped inputs
 
+### 3.8 Time-period + rollover test cases
+
+This is the category most apps quietly break at — "it works today, hollow after month-end". Explicitly cover:
+
+**Schema presence**
+- Is there a `Billing Periods` (or equivalent monthly/weekly snapshot) table? If not, the app cannot show month-over-month trends reliably — flag as CRITICAL.
+- Is there a `Usage Counters` / accumulator table for per-subscription daily/weekly/monthly rollups (OCR-015)?
+- Does every "cycle/validity" entity (subscription, balance, bundle, promo) have explicit `effective_from` / `effective_to` or `cycle_start` / `cycle_end` + `status`?
+- Does every plan/offer have `auto_renew` and `validity_days` (or equivalent)?
+
+**Live-state checks**
+- Seed data MUST span multiple periods: last 90 days at minimum. Insert records dated in each of the last 3 calendar months so MoM dashboards have bars, not a single data point.
+- Include at least a few records with `effective_to` in the past AND status=Active (representing "expired but not yet swept"). Running the expiry workflow must flip these to Expired.
+- Include at least one record with `auto_renew=true` and sufficient wallet balance so the renewal workflow fires and generates a new downstream record.
+- Include at least one record with `auto_renew=true` and INSUFFICIENT wallet — renewal should fail gracefully (not crash), log a notification.
+
+**Rollover workflow tests**
+- **TC-TIME-01** `plan-expiry.mjs` idempotent — 2nd run writes 0 rows.
+- **TC-TIME-02** `plan-expiry.mjs` flips all `effective_to < now()` Active balances to Expired. Post-run: `SELECT count() FROM balances WHERE effective_to < now() AND status='[Active]'` returns 0.
+- **TC-TIME-03** Auto-renew path: seed one balance with `auto_renew=true` + wallet funded, effective_to=yesterday → run expiry → assert new Balance created with cycle_start=today, wallet debited, lifecycle event logged.
+- **TC-TIME-04** Auto-renew insufficient-funds: same setup with wallet=0 → run expiry → old balance Expired, no new balance, notification row created.
+- **TC-TIME-05** `period-rollover.mjs` for last 3 months → Billing Periods has 3 rows; ARPU, Total Recharge Amount, Active Subscribers are non-zero for non-empty months.
+- **TC-TIME-06** Re-run rollover with same `Source Hash` → no writes ("unchanged" log).
+- **TC-TIME-07** Change a historical recharge amount → re-run rollover → the affected Billing Period row updates (new Source Hash).
+- **TC-TIME-08** Usage Counter accumulation: insert N Usage Transactions in a day → run counter-compute step → `Daily` counter row for that (subscription, date) matches `SUM(used_amount)`.
+- **TC-TIME-09** Quarter/year rollup (if modelled): Monthly → Quarterly → Yearly period rows aggregate correctly.
+
+**Cross-period correctness**
+- Dashboards with "this month vs last month" must show non-zero values for both when seed data spans 2+ months.
+- Expired balance should NOT count toward Subscription.Total Remaining Balance rollup.
+- Loyalty points earned in Month 1 but with `Expiry Date` before end of Month 3 → must appear in a "points expiring soon" surface (if the app exposes one).
+
+**Time-zone + date-boundary**
+- Verify date-filter SQL uses `toDate()` / explicit `BETWEEN` boundaries, not floating `>= now() - INTERVAL 30 DAY` (off-by-one across timezone changes). Cover one edge case where a record's timestamp is exactly at period boundary (midnight 1st-of-month).
+
+**Schedule wiring**
+- Check there is a scheduled runner (cron, GitHub Action, ERPAI scheduler) for each rollover workflow. Without it, the data goes stale on the 1st of the month. Document in the test report whether scheduling is configured — not just whether the script runs.
+
 ### 3.8 Output the plan
 Print it to stdout in a tight table:
 | ID | Area | Case | Expected |
@@ -334,6 +372,11 @@ The skill completes when **all** of these hold:
 - [ ] Every dashboard renders with visible data (not placeholders)
 - [ ] Every workflow ran successfully + idempotently
 - [ ] Roles, permissions, and audit log have entries
+- [ ] **Seed data spans ≥3 calendar months** so MoM trends render
+- [ ] **Expiry sweep leaves zero expired-but-Active records**
+- [ ] **Rollover workflow produced period snapshots** with non-zero aggregates
+- [ ] **Period rollover is idempotent** + re-runs unchanged on same data
+- [ ] Scheduling is documented (cron/scheduler) for every rollover workflow
 - [ ] `test-report.md` written with pass/fail counts, critical failures listed, screenshots attached
 
 If any item is NOT satisfied, the report must explicitly say so — do not claim PASS with hidden gaps.
